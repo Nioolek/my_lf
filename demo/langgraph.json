@@ -1,0 +1,6 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+        "counter": "./my_graph.py:graph"
+    }
+}

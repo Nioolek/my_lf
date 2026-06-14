@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(update-config)",
+      "WebSearch",
+      "WebFetch(domain:changelog.langchain.com)",
+      "WebFetch(domain:www.zenml.io)",
+      "WebFetch(domain:docs.langchain.com)",
+      "WebFetch(domain:cohorte.co)",
+      "WebFetch(domain:github.com)",
+      "Bash(echo \"HTTP_PROXY=$HTTP_PROXY\")",
+      "Bash(echo \"HTTPS_PROXY=$HTTPS_PROXY\")",
+      "Bash(echo \"http_proxy=$http_proxy\")",
+      "Bash(echo \"https_proxy=$https_proxy\")",
+      "Bash(echo \"ALL_PROXY=$ALL_PROXY\")",
+      "Bash(curl -s --connect-timeout 3 http://127.0.0.1:7890 -o /dev/null -w \"%{http_code}\")",
+      "Bash(pip install:*)",
+      "Bash(pip show:*)",
+      "Read(//c/Users/37931/AppData/Roaming/Python/Python311/site-packages/langgraph_api/**)",
+      "Read(//c/Users/37931/AppData/Roaming/Python/Python311/site-packages/langgraph_api//**)",
+      "Bash(python3.13 --version)",
+      "Bash(python3.13 -m venv .venv)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(pip --version)",
+      "Bash(python3.13 -m venv /g/code/my_lf/.venv 2>&1)",
+      "Bash(source /g/code/my_lf/.venv/Scripts/activate)",
+      "Bash(git clone:*)",
+      "Bash(python -m pip install --upgrade pip setuptools wheel)",
+      "Bash(pip list:*)",
+      "Bash(python -c \"import langgraph_api; print\\(langgraph_api.__file__\\)\")",
+      "Bash(python -c \"import langgraph_runtime_inmem; print\\(langgraph_runtime_inmem.__file__\\)\")",
+      "Bash(python -c \"import langgraph_runtime; print\\(langgraph_runtime.__file__\\)\")",
+      "Bash(cp -r /g/code/my_lf/.venv/Lib/site-packages/langgraph_api /g/code/my_lf/src/langgraph_api)",
+      "Bash(cp -r /g/code/my_lf/.venv/Lib/site-packages/langgraph_runtime /g/code/my_lf/src/langgraph_runtime)",
+      "Bash(cp -r /g/code/my_lf/.venv/Lib/site-packages/langgraph_runtime_inmem /g/code/my_lf/src/langgraph_runtime_inmem)",
+      "Bash(find /g/code/my_lf/src/langgraph_api /g/code/my_lf/src/langgraph_runtime /g/code/my_lf/src/langgraph_runtime_inmem -type d -name \"__pycache__\" -exec rm -rf {} +)"
+    ],
+    "defaultMode": "bypassPermissions"
+  }
+}

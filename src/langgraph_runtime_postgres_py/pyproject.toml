@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langgraph-runtime-postgres-py"
+version = "0.1.0"
+description = "Pure-Python Postgres + Redis runtime backend for LangGraph API (no Go/gRPC dependency)"
+requires-python = ">=3.13"
+dependencies = [
+    "langgraph-api>=0.10.0",
+    "langgraph-checkpoint-postgres>=3.1.0",
+    "psycopg[binary]>=3.2.0",
+    "psycopg-pool>=3.2.0",
+    "redis[hiredis]>=5.0.0",
+    "pgvector>=0.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "testcontainers>=4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"*" = ["migrations/*.sql"]
