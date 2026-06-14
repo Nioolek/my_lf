@@ -976,17 +976,11 @@ class Threads(Authenticated):
             (str(thread_id),),
         )
         if not existing_rows:
-            async def _empty():
-                return
-                yield
-            return _empty()
+            raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
 
         existing = _row_to_dict(existing_rows[0])
         if filters and not _check_filter_match(existing.get("metadata", {}), filters):
-            async def _empty():
-                return
-                yield
-            return _empty()
+            raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
 
         now = datetime.now(UTC)
         merged_metadata = {**existing.get("metadata", {}), **metadata}
@@ -1207,8 +1201,12 @@ class Threads(Authenticated):
         try:
             checkpointer = Checkpointer()
             await checkpointer.adelete_thread(str(thread_id))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "Failed to delete checkpoint for thread",
+                thread_id=thread_id,
+                error=str(e),
+            )
 
         # Delete thread
         await conn.execute(
@@ -1544,23 +1542,20 @@ class Threads(Authenticated):
             thread_id: UUID,
             seen_runs: set[UUID],
         ) -> list[tuple[UUID, asyncio.Queue]]:
-            """Subscribe to the thread stream."""
-            # For Postgres runtime, this uses Redis Pub/Sub
-            from langgraph_runtime_postgres_py.run_queue import get_redis
+            """Subscribe to the thread stream, creating queues for unseen runs."""
+            from langgraph_runtime_inmem.inmem_stream import ContextQueue, get_stream_manager
 
             thread_id = _ensure_uuid(thread_id)
+            stream_manager = get_stream_manager()
             queues = []
 
-            redis = await get_redis()
-            # Create a pubsub subscription for thread events
+            # Add thread stream queue
             if thread_id not in seen_runs:
-                pubsub = redis.pubsub()
-                await pubsub.subscribe(f"thread:{thread_id}:stream")
-                queue = asyncio.Queue()
+                queue = await stream_manager.add_thread_stream(thread_id)
                 queues.append((thread_id, queue))
                 seen_runs.add(thread_id)
 
-            # Get runs for this thread
+            # Get runs for this thread and add queues for unseen ones
             run_rows = await conn.execute(
                 "SELECT run_id FROM runs WHERE thread_id = %s",
                 (str(thread_id),),
@@ -1568,7 +1563,7 @@ class Threads(Authenticated):
             for row in run_rows:
                 run_id = row["run_id"]
                 if run_id not in seen_runs:
-                    queue = asyncio.Queue()
+                    queue = await stream_manager.add_queue(run_id, thread_id)
                     queues.append((run_id, queue))
                     seen_runs.add(run_id)
 
@@ -1929,8 +1924,12 @@ class Runs(Authenticated):
         try:
             checkpointer = Checkpointer()
             await checkpointer.adelete_for_runs([str(run_id)])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "Failed to delete checkpoint for run",
+                run_id=run_id,
+                error=str(e),
+            )
 
         existing_rows = await conn.execute(
             "SELECT run_id FROM runs WHERE run_id = %s AND thread_id = %s",
@@ -1961,127 +1960,137 @@ class Runs(Authenticated):
         ctx: Auth.types.BaseAuthContext | None = None,
     ) -> None:
         """Cancel runs."""
-        # Validate arguments
-        if assistant_id is not None:
-            if thread_id is not None or run_ids is not None or status is not None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Cannot specify 'thread_id', 'run_ids', or 'status' when using 'assistant_id'",
-                )
-            assistant_id = _ensure_uuid(assistant_id)
-        elif status is not None:
-            if thread_id is not None or run_ids is not None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Cannot specify 'thread_id' or 'run_ids' when using 'status'",
-                )
-        else:
-            if thread_id is None or run_ids is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Must provide either a status, an assistant_id, or both 'thread_id' and 'run_ids'",
-                )
+        async with AsyncExitStack() as stack:
+            if conn is None:
+                conn = await stack.enter_async_context(db_connect())
 
-        if run_ids is not None:
-            run_ids = [_ensure_uuid(rid) for rid in run_ids]
-        if thread_id is not None:
-            thread_id = _ensure_uuid(thread_id)
-
-        filters = await Runs.handle_event(
-            ctx,
-            "update",
-            Auth.types.ThreadsUpdate(
-                thread_id=thread_id,
-                action=action,
-                metadata={"run_ids": [str(r) for r in run_ids] if run_ids else None, "status": status},
-            ),
-        )
-
-        status_list: tuple[str, ...] = ()
-        if status == "all":
-            status_list = ("pending", "running")
-        elif status in ("pending", "running"):
-            status_list = (status,)
-
-        # Build query to find matching runs
-        wheres = ["1=1"]
-        params: list[Any] = []
-
-        if assistant_id is not None:
-            wheres.append("assistant_id = %s AND status IN ('pending', 'running')")
-            params.append(str(assistant_id))
-        elif status_list:
-            placeholders = ",".join(["%s"] * len(status_list))
-            wheres.append(f"status IN ({placeholders})")
-            params.extend(status_list)
-        else:
-            wheres.append("thread_id = %s AND run_id IN (%s)")
-            params.append(str(thread_id))
-            placeholders = ",".join(["%s"] * len(run_ids))
-            wheres[-1] = f"thread_id = %s AND run_id IN ({placeholders})"
-            params = [str(thread_id)] + [str(r) for r in run_ids]
-
-        rows = await conn.execute(
-            f"SELECT * FROM runs WHERE {' AND '.join(wheres)}",
-            params,
-        )
-
-        candidate_runs = [_row_to_dict(r) for r in rows]
-
-        if filters:
-            if thread_id:
-                thread_rows = await conn.execute(
-                    "SELECT metadata FROM threads WHERE thread_id = %s",
-                    (str(thread_id),),
-                )
-                if thread_rows:
-                    if not _check_filter_match(thread_rows[0].get("metadata", {}), filters):
-                        candidate_runs = []
-            else:
-                # Filter by thread auth
-                filtered_runs = []
-                for run in candidate_runs:
-                    tid = run.get("thread_id")
-                    if tid:
-                        thread_rows = await conn.execute(
-                            "SELECT metadata FROM threads WHERE thread_id = %s",
-                            (str(tid),),
-                        )
-                        if thread_rows and _check_filter_match(thread_rows[0].get("metadata", {}), filters):
-                            filtered_runs.append(run)
-                candidate_runs = filtered_runs
-
-        if not candidate_runs:
+            # Validate arguments
             if assistant_id is not None:
-                return
-            raise HTTPException(status_code=404, detail="No runs found to cancel.")
-
-        # Cancel runs
-        now = datetime.now(UTC)
-        for run in candidate_runs:
-            run_id = run["run_id"]
-            run_thread_id = run["thread_id"]
-
-            if run["status"] in ("pending", "running"):
-                if run["status"] == "pending":
-                    # Update thread to idle if no other pending/running runs
-                    other_rows = await conn.execute(
-                        "SELECT COUNT(*) as cnt FROM runs WHERE thread_id = %s AND status IN ('pending', 'running') AND run_id != %s",
-                        (str(run_thread_id), str(run_id)),
+                if thread_id is not None or run_ids is not None or status is not None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Cannot specify 'thread_id', 'run_ids', or 'status' when using 'assistant_id'",
                     )
-                    if other_rows and other_rows[0]["cnt"] == 0:
-                        await conn.execute(
-                            "UPDATE threads SET status = 'idle', updated_at = %s WHERE thread_id = %s",
-                            (now, str(run_thread_id)),
-                        )
+                assistant_id = _ensure_uuid(assistant_id)
+            elif status is not None:
+                if thread_id is not None or run_ids is not None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Cannot specify 'thread_id' or 'run_ids' when using 'status'",
+                    )
+            else:
+                if thread_id is None or run_ids is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Must provide either a status, an assistant_id, or both 'thread_id' and 'run_ids'",
+                    )
 
-                if action == "rollback":
-                    await Runs.delete(conn, run_id, thread_id=run_thread_id)
+            if run_ids is not None:
+                run_ids = [_ensure_uuid(rid) for rid in run_ids]
+            if thread_id is not None:
+                thread_id = _ensure_uuid(thread_id)
+
+            filters = await Runs.handle_event(
+                ctx,
+                "update",
+                Auth.types.ThreadsUpdate(
+                    thread_id=thread_id,
+                    action=action,
+                    metadata={"run_ids": [str(r) for r in run_ids] if run_ids else None, "status": status},
+                ),
+            )
+
+            status_list: tuple[str, ...] = ()
+            if status == "all":
+                status_list = ("pending", "running")
+            elif status in ("pending", "running"):
+                status_list = (status,)
+
+            # Build query to find matching runs
+            wheres = ["1=1"]
+            params: list[Any] = []
+
+            if assistant_id is not None:
+                wheres.append("assistant_id = %s AND status IN ('pending', 'running')")
+                params.append(str(assistant_id))
+            elif status_list:
+                placeholders = ",".join(["%s"] * len(status_list))
+                wheres.append(f"status IN ({placeholders})")
+                params.extend(status_list)
+            else:
+                wheres.append("thread_id = %s AND run_id IN (%s)")
+                params.append(str(thread_id))
+                placeholders = ",".join(["%s"] * len(run_ids))
+                wheres[-1] = f"thread_id = %s AND run_id IN ({placeholders})"
+                params = [str(thread_id)] + [str(r) for r in run_ids]
+
+            rows = await conn.execute(
+                f"SELECT * FROM runs WHERE {' AND '.join(wheres)}",
+                params,
+            )
+
+            candidate_runs = [_row_to_dict(r) for r in rows]
+
+            if filters:
+                if thread_id:
+                    thread_rows = await conn.execute(
+                        "SELECT metadata FROM threads WHERE thread_id = %s",
+                        (str(thread_id),),
+                    )
+                    if thread_rows:
+                        if not _check_filter_match(thread_rows[0].get("metadata", {}), filters):
+                            candidate_runs = []
                 else:
-                    await conn.execute(
-                        "UPDATE runs SET status = 'interrupted', updated_at = %s WHERE run_id = %s",
-                        (now, str(run_id)),
-                    )
+                    # Batch fetch thread metadata to avoid N+1 queries
+                    unique_thread_ids = {str(run.get("thread_id")) for run in candidate_runs if run.get("thread_id")}
+                    if unique_thread_ids:
+                        placeholders = ",".join(["%s"] * len(unique_thread_ids))
+                        thread_rows = await conn.execute(
+                            f"SELECT thread_id, metadata FROM threads WHERE thread_id IN ({placeholders})",
+                            list(unique_thread_ids),
+                        )
+                        thread_metadata_map = {r["thread_id"]: r.get("metadata", {}) for r in thread_rows}
+
+                        filtered_runs = []
+                        for run in candidate_runs:
+                            tid = run.get("thread_id")
+                            if tid and _check_filter_match(thread_metadata_map.get(str(tid), {}), filters):
+                                filtered_runs.append(run)
+                        candidate_runs = filtered_runs
+                    else:
+                        candidate_runs = []
+
+            if not candidate_runs:
+                if assistant_id is not None:
+                    return
+                raise HTTPException(status_code=404, detail="No runs found to cancel.")
+
+            # Cancel runs
+            now = datetime.now(UTC)
+            for run in candidate_runs:
+                run_id = run["run_id"]
+                run_thread_id = run["thread_id"]
+
+                if run["status"] in ("pending", "running"):
+                    if run["status"] == "pending":
+                        # Update thread to idle if no other pending/running runs
+                        other_rows = await conn.execute(
+                            "SELECT COUNT(*) as cnt FROM runs WHERE thread_id = %s AND status IN ('pending', 'running') AND run_id != %s",
+                            (str(run_thread_id), str(run_id)),
+                        )
+                        if other_rows and other_rows[0]["cnt"] == 0:
+                            await conn.execute(
+                                "UPDATE threads SET status = 'idle', updated_at = %s WHERE thread_id = %s",
+                                (now, str(run_thread_id)),
+                            )
+
+                    if action == "rollback":
+                        await Runs.delete(conn, run_id, thread_id=run_thread_id)
+                    else:
+                        await conn.execute(
+                            "UPDATE runs SET status = 'interrupted', updated_at = %s WHERE run_id = %s",
+                            (now, str(run_id)),
+                        )
 
     @staticmethod
     async def search(
@@ -2115,17 +2124,21 @@ class Runs(Authenticated):
             params + [limit, offset],
         )
 
+        # Batch fetch thread metadata once to avoid N+1 in auth filtering
+        thread_metadata = None
+        if filters:
+            thread_rows = await conn.execute(
+                "SELECT metadata FROM threads WHERE thread_id = %s",
+                (str(thread_id),),
+            )
+            thread_metadata = thread_rows[0].get("metadata", {}) if thread_rows else {}
+
         async def _yield():
             for row in rows:
                 row_dict = _row_to_dict(row)
                 if filters:
-                    thread_rows = await conn.execute(
-                        "SELECT metadata FROM threads WHERE thread_id = %s",
-                        (str(thread_id),),
-                    )
-                    if thread_rows:
-                        if not _check_filter_match(thread_rows[0].get("metadata", {}), filters):
-                            continue
+                    if not _check_filter_match(thread_metadata, filters):
+                        continue
                 if select:
                     yield {k: v for k, v in row_dict.items() if k in select}
                 else:
@@ -2178,9 +2191,9 @@ class Runs(Authenticated):
         """Mark stale runs as timed out."""
         async with db_connect() as conn:
             await conn.execute(
-                f"UPDATE runs SET status = 'timeout', updated_at = %s "
-                f"WHERE status = 'running' AND updated_at < NOW() - INTERVAL '{STALE_RUN_TIMEOUT_SECS} seconds'",
-                (datetime.now(UTC),),
+                "UPDATE runs SET status = 'timeout', updated_at = %s "
+                "WHERE status = 'running' AND updated_at < NOW() - INTERVAL '%s seconds'",
+                (datetime.now(UTC), STALE_RUN_TIMEOUT_SECS),
             )
 
     @asynccontextmanager
@@ -2233,14 +2246,12 @@ class Runs(Authenticated):
             run_id: UUID,
             thread_id: UUID | None = None,
         ) -> asyncio.Queue:
-            """Subscribe to the run stream."""
-            from langgraph_runtime_postgres_py.run_queue import get_redis
+            """Subscribe to the run stream, returning a queue that receives messages."""
+            from langgraph_runtime_inmem.inmem_stream import ContextQueue, get_stream_manager
 
             run_id = _ensure_uuid(run_id)
-            redis = await get_redis()
-            pubsub = redis.pubsub()
-            await pubsub.subscribe(f"run:{run_id}:stream")
-            queue = asyncio.Queue()
+            stream_manager = get_stream_manager()
+            queue = await stream_manager.add_queue(run_id, thread_id)
             return queue
 
         @staticmethod
