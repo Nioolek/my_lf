@@ -56,6 +56,10 @@ s_code = ParagraphStyle("CodeCN", parent=styles["Code"],
     backColor=HexColor("#f1f5f9"), leftIndent=3*mm, rightIndent=3*mm,
     spaceBefore=1*mm, spaceAfter=2*mm, borderWidth=0.5,
     borderColor=HexColor("#cbd5e1"), borderPadding=3)
+s_diagram = ParagraphStyle("DiagramCN", parent=styles["Code"],
+    fontName="MSYH", fontSize=8, leading=12, textColor=HexColor("#1e293b"),
+    backColor=HexColor("#f1f5f9"), leftIndent=3*mm, rightIndent=3*mm,
+    spaceBefore=1*mm, spaceAfter=2*mm)
 
 s_bullet = ParagraphStyle("BulletCN", parent=s_body,
     leftIndent=8*mm, bulletIndent=3*mm, spaceAfter=1.5*mm)
@@ -66,6 +70,11 @@ s_toc = ParagraphStyle("TOCCN", parent=s_body, fontSize=11, leading=18,
     leftIndent=5*mm, textColor=C_PRIMARY)
 
 # ── Helpers ──
+import re
+_CN_RE = re.compile(r'[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]')
+def _has_chinese(text): return bool(_CN_RE.search(text))
+def _escape(text): return text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\n","<br/>")
+
 def P(text, style=s_body):
     return Paragraph(text, style)
 
@@ -79,7 +88,8 @@ def H3(text):
     return Paragraph(text, s_h3)
 
 def Code(text):
-    return Paragraph(text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\n","<br/>"), s_code)
+    style = s_diagram if _has_chinese(text) else s_code
+    return Paragraph(_escape(text), style)
 
 def Bullet(text):
     return Paragraph(f"\u2022  {text}", s_bullet)
