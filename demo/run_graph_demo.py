@@ -34,6 +34,12 @@ def loop_factory():
     return asyncio.SelectorEventLoop(selectors.SelectSelector())
 
 
+async def fetchone(awaitable):
+    """Await the coroutine to get AsyncIterator, then fetch the first item."""
+    iterator = await awaitable
+    return await anext(iterator)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Demo 1: Simple Counter Graph
 # ═══════════════════════════════════════════════════════════════════════════
@@ -85,7 +91,7 @@ async def demo_counter_graph():
 
     # Create a thread for stateful execution
     async with connect() as conn:
-        thread = await Threads.create(conn, metadata={"demo": "counter"})
+        thread = await fetchone(Threads.put(conn, None, metadata={"demo": "counter"}))
         thread_id = str(thread["thread_id"])
 
     config = {"configurable": {"thread_id": thread_id}}
@@ -162,7 +168,7 @@ async def demo_hitl_graph():
     )
 
     async with connect() as conn:
-        thread = await Threads.create(conn, metadata={"demo": "hitl"})
+        thread = await fetchone(Threads.put(conn, None, metadata={"demo": "hitl"}))
         thread_id = str(thread["thread_id"])
 
     config = {"configurable": {"thread_id": thread_id}}
@@ -212,6 +218,7 @@ async def demo_full_api_flow():
     from langgraph_runtime_postgres_py.store import collect_store_from_env, get_store, exit_store
     from langgraph_runtime_postgres_py.ops import Assistants, Threads, Runs, Crons, RunEvents
     from langgraph_runtime_postgres_py.metrics import get_metrics
+    from langgraph_api.graph import collect_graphs_from_env
 
     class AgentState(TypedDict):
         query: str
@@ -238,30 +245,32 @@ async def demo_full_api_flow():
     await start_checkpointer()
     await start_redis()
     await collect_store_from_env()
+    await collect_graphs_from_env(register=True)  # Register graphs so assert_graph_exists works
 
     checkpointer = Checkpointer()
     graph = builder.compile(checkpointer=checkpointer)
 
     async with connect() as conn:
         # 1. Create assistant (this is what API does when a graph is registered)
-        assistant = await Assistants.create(
-            conn, graph_id="agent", name="Demo Agent",
+        assistant = await fetchone(Assistants.put(
+            conn, None,  # assistant_id=None to auto-generate
+            graph_id="agent", name="Demo Agent",
             metadata={"type": "qa"}, config={},
-        )
+        ))
         assistant_id = assistant["assistant_id"]
         log.info("Created assistant", id=str(assistant_id))
 
         # 2. Create thread
-        thread = await Threads.create(conn, metadata={"user": "demo_user"})
+        thread = await fetchone(Threads.put(conn, None, metadata={"user": "demo_user"}))
         thread_id = thread["thread_id"]
         log.info("Created thread", id=str(thread_id))
 
         # 3. Create run (pending)
-        run = await Runs.create(
-            conn, thread_id=thread_id, assistant_id=assistant_id,
-            kwargs={"input": {"query": "What is the meaning of life?"}},
+        run = await fetchone(Runs.put(
+            conn, assistant_id, {"input": {"query": "What is the meaning of life?"}},
+            thread_id=thread_id,
             metadata={"attempt": 1},
-        )
+        ))
         run_id = run["run_id"]
         log.info("Created run", id=str(run_id), status=run["status"])
 
@@ -279,7 +288,7 @@ async def demo_full_api_flow():
         log.info("Enqueued run to Redis", msg_id=str(msg_id))
 
         # 6. Actually execute the graph (in real system, worker does this)
-        await Runs.update(conn, run_id=run_id, status="running")
+        await Runs.set_status(conn, run_id, "running")
         config = {"configurable": {"thread_id": str(thread_id)}}
         result = await graph.ainvoke(
             {"query": "What is the meaning of life?", "steps": [], "answer": ""},
@@ -288,7 +297,7 @@ async def demo_full_api_flow():
         log.info("Graph executed", answer=result["answer"], steps=result["steps"])
 
         # 7. Mark run completed
-        await Runs.update(conn, run_id=run_id, status="success")
+        await Runs.set_status(conn, run_id, "success")
         await publish_event(EventType.RUN_COMPLETED, {
             "run_id": str(run_id), "thread_id": str(thread_id),
         })
@@ -299,13 +308,20 @@ async def demo_full_api_flow():
         log.info("Metrics", workers=metrics["workers"], pool=metrics["pool"])
 
         # 9. Search threads
-        threads = await Threads.search(conn, metadata={"user": "demo_user"})
+        threads_iter, _ = await Threads.search(conn, metadata={"user": "demo_user"})
+        threads = [t async for t in threads_iter]
         log.info("Found threads", count=len(threads))
 
         # 10. Cleanup
-        await Runs.delete(conn, run_id=run_id)
-        await Threads.delete(conn, thread_id=thread_id)
-        await Assistants.delete(conn, assistant_id=assistant_id)
+        await fetchone(Runs.delete(conn, run_id, thread_id=thread_id))
+        await fetchone(Threads.delete(conn, thread_id))
+        # Note: Assistants.delete requires its own connection (conn=None opens new),
+        # so we use the current conn which is in the same transaction
+        try:
+            await conn.execute("DELETE FROM assistant_versions WHERE assistant_id = %s", (str(assistant_id),))
+            await conn.execute("DELETE FROM assistants WHERE assistant_id = %s", (str(assistant_id),))
+        except Exception as e:
+            log.warning("Failed to delete assistant", error=str(e))
         log.info("Cleaned up all entities")
 
     await exit_store()
